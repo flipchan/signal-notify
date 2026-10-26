@@ -48,6 +48,9 @@ class Message:
     key material, digest, size, contentType, fileName…) — pass each to
     :func:`signalnotify.native.attachments.download_attachment` to fetch and
     decrypt it.
+
+    ``contacts`` holds any shared contact cards as ``{name, number}`` dicts
+    (``DataMessage.contact``).
     """
     timestamp: int | None
     body: str | None
@@ -57,6 +60,7 @@ class Message:
     group_id: str | None
     raw: dict = field(default_factory=dict, repr=False)
     attachments: list = field(default_factory=list)
+    contacts: list = field(default_factory=list)
 
     @property
     def is_text(self) -> bool:
@@ -122,6 +126,29 @@ def _parse_attachments(dm: dict) -> list:
     return out
 
 
+def _parse_contacts(dm: dict) -> list:
+    """Decode ``DataMessage.contact`` cards into ``[{name, number}, …]``.
+
+    ``Contact`` is ``message { name = 1; number = 2; … }`` (other fields, e.g.
+    ``avatar``, are ignored).
+    """
+    def _s(val):
+        return val.decode("utf-8", "replace") if isinstance(val, bytes) else (val or "")
+
+    out = []
+    for card_bytes in dm.get(P.DATA_CONTACT, []):
+        try:
+            card = decode_proto(card_bytes)
+        except (ValueError, KeyError) as e:
+            log.warning("skipping unparseable contact card: %s", e)
+            continue
+        name = _s(card.get(1, [b""])[0])
+        number = _s(card.get(2, [b""])[0])
+        if name or number:
+            out.append({"name": name, "number": number})
+    return out
+
+
 def parse_content(plaintext: bytes, self_ids: set, source: str | None,
                   envelope_ts: int | None) -> Message | None:
     """Parse a decrypted ``Content`` protobuf into a :class:`Message`.
@@ -142,7 +169,8 @@ def parse_content(plaintext: bytes, self_ids: set, source: str | None,
         return Message(timestamp=dm.get(P.DATA_TIMESTAMP, [envelope_ts])[0], body=body or None,
                        source=source, source_name=None, note_to_self=False,
                        group_id=group_id, raw={},
-                       attachments=_parse_attachments(dm))
+                       attachments=_parse_attachments(dm),
+                       contacts=_parse_contacts(dm))
 
     if P.CONTENT_SYNC_MESSAGE in fields:
         sync = decode_proto(fields[P.CONTENT_SYNC_MESSAGE][0])
@@ -226,10 +254,45 @@ def _decrypt_envelope(env: dict, account_keys: dict, sessions: dict,
         return plaintext, source, ts
 
     if etype == TYPE_SEALED:
-        # Sealed-sender (unidentified) delivery. Unwrapping needs the
-        # sealed-sender protocol; not required for the phone's own Note-to-Self
-        # sync transcripts, which are sender-authenticated. Left as a gap.
-        raise NotImplementedError("sealed-sender (type 6) unwrap not implemented")
+        # Sealed-sender (unidentified) delivery. Unwrap Sealed Sender v1 — see
+        # signalnotify/native/sealed_sender.py. Unsupported versions or
+        # undecryptable envelopes raise NotImplementedError, which the caller
+        # quarantines (and can replay if support is added later).
+        from .sealed_sender import SealedSenderError, unwrap_v1
+
+        try:
+            res = unwrap_v1(account_keys, content)
+        except SealedSenderError as exc:
+            raise NotImplementedError(f"sealed-sender: {exc}")
+
+        sender_uuid = res["sender_uuid"]
+        sender_dev = res["sender_device"]
+        # Only a server-attested (cert_valid) sender is treated as genuine; an
+        # unvalidated sender's source is prefixed so it can't impersonate a
+        # known contact.
+        if sender_uuid and not res["cert_valid"]:
+            source = "unverified:" + sender_uuid
+        else:
+            source = sender_uuid or source
+        sealed_key = f"{sender_uuid}:{sender_dev}"
+        inner = res["inner"]
+
+        if res["msg_type"] == 1:  # PREKEY_MESSAGE
+            session, plaintext = accept_prekey(account_keys, inner)
+            sessions[sealed_key] = session_to_json(session)
+            return plaintext, source, ts
+
+        if res["msg_type"] == 2:  # MESSAGE (whisper)
+            stored = sessions.get(sealed_key)
+            if stored is None:
+                raise ValueError(f"sealed: no session for {sealed_key} (whisper before prekey)")
+            session = session_from_json(stored)
+            plaintext = ratchet_decrypt(session, inner)
+            sessions[sealed_key] = session_to_json(session)
+            return plaintext, source, ts
+
+        # Senderkey / plaintext-content: nothing to decrypt here.
+        return None, source, ts
 
     # Receipts / plaintext-content envelopes carry no ciphertext to decrypt.
     return None, source, ts
